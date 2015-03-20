@@ -84,6 +84,9 @@ class exports.ApiaxleProxy extends AxleApp
     return next new ApiUnknown "No api specified (via subdomain)"
 
   getKeyringNames: ( req, res, next ) ->
+    if req.is_keyless_get == true
+        return next()
+
     req.key.supportedKeyrings ( err, names ) ->
       return next err if err
 
@@ -91,6 +94,14 @@ class exports.ApiaxleProxy extends AxleApp
       return next()
 
   getApi: ( req, res, next ) =>
+    api = null
+    api = cache.get(req.api_name)
+
+    if api != null
+      this.logger.debug("Found api '" + req.api_name + "' in cache...")
+      req.api = api
+      return next()
+
     @model( "apifactory" ).find [ req.api_name ], ( err, results ) =>
       return next err if err
 
@@ -104,6 +115,8 @@ class exports.ApiaxleProxy extends AxleApp
         return next new ApiDisabled "This API has been disabled."
 
       req.api = api
+      # Expire this cache entry in 10 minutes
+      cache.put(req.api_name, api, 600000)
       return next()
 
   # create a key (which expires) from the IP address and use
@@ -119,6 +132,40 @@ class exports.ApiaxleProxy extends AxleApp
          req.connection.socket.remoteAddress
 
     key_name = "ip-#{ req.api_name }-#{ ip }"
+
+    model = @model "keyfactory"
+    model.find [ key_name ], ( err, results ) =>
+      return cb err if err
+
+      # we've a hit, return the key
+      return cb null, results[key_name] if results[key_name]
+
+      create_link = [
+        # create the key
+        ( cb ) ->
+          { keylessQps, keylessQpd } = req.api.data
+          model.create key_name, { qps: keylessQps, qpd: keylessQpd }, cb
+
+        # now link the key
+        ( cb ) -> req.api.linkKey key_name, cb
+      ]
+
+      # return the new key
+      async.series create_link, ( err, [ new_key ] ) -> cb err, new_key
+
+  # create a key used by keyless get operations from the address and use
+  # that. Assumes req.api.data.extractKeyRegex has already been
+  # checked.
+  createKeyBasedOnGetAndIp: ( req, cb ) ->
+    # try to get the ip address
+    # TODO: I think x-forwarded-for can have many, comma seperated
+    # addresses.
+    ip = req.headers["x-forwarded-for"] or
+         req.connection.remoteAddress or
+         req.socket.remoteAddress or
+         req.connection.socket.remoteAddress
+
+    key_name = "ip-#{ req.method }-#{ req.api_name }-#{ ip }"
 
     model = @model "keyfactory"
     model.find [ key_name ], ( err, results ) =>
@@ -164,12 +211,22 @@ class exports.ApiaxleProxy extends AxleApp
         req.key_name = key.id
         return next()
 
+    # If the api allows keyless Get Use
+    if req.api.data.allowKeylessGetUse && req.method == 'GET'
+      req.is_keyless_get = true
+      return next()
+
     return next new KeyError "No api_key specified."
 
   getKey: ( req, res, next ) =>
     # it's possible we've already got this thanks to the keyless
     # stuff
     return next() if req.key
+
+    # it's also possible we don't need to get a key as this is a
+    # keyless get api
+    if req.key || req.is_keyless_get == true
+      return next()
 
     @model( "keyfactory" ).find [ req.key_name ], ( err, results ) =>
       return next err if err
@@ -213,6 +270,8 @@ class exports.ApiaxleProxy extends AxleApp
 
   authenticateWithKey: ( req, res, next ) =>
     all = []
+    if req.is_keyless_get == true
+      return next()
 
     # outright disabled
     if req.key.isDisabled()
@@ -298,6 +357,8 @@ class exports.ApiaxleProxy extends AxleApp
       req.key.data.qps
       req.key.data.qpd
     ]
+    if req.is_keyless_get == true
+      return next()
 
     @model( "apilimits" ).apiHit args..., ( err, [ newQpd, newQps ] ) ->
       return next err if err
@@ -401,7 +462,11 @@ class exports.ApiaxleProxy extends AxleApp
 
       # run the middleware above
       async.eachSeries @middleware(), ittr, ( err ) =>
-        return @error err, req, res if err
+        if err
+          res.setHeader('Cache-Control', 'no-cache, no-store, max-age=0, must-revalidate')
+          res.setHeader('Pragma', 'no-cache')
+          res.setHeader('Expires', 'Fri, 01 Jan 1990 00:00:00 GMT')
+          return @error err, req, res
 
         # use the correct module and create the correct agent (http vs
         # https)
@@ -459,6 +524,9 @@ class exports.ApiaxleProxy extends AxleApp
 
         proxyReq.on "error", ( err ) =>
           @logger.debug "Proxy error: #{ err.message }"
+          res.setHeader('Cache-Control', 'no-cache, no-store, max-age=0, must-revalidate')
+          res.setHeader('Pragma', 'no-cache')
+          res.setHeader('Expires', 'Fri, 01 Jan 1990 00:00:00 GMT')
           @handleProxyError err, req, res
 
         return req.pipe proxyReq

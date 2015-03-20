@@ -119,6 +119,11 @@ class exports.ApiFactory extends Redis
         optional: true
         default: false
         docs: "If true then allow for keyless access to this API. Also see keylessQps and keylessQpd."
+      allowKeylessGetUse:
+        type: "boolean"
+        optional: true
+        default: false
+        docs: "If true then allow for keyless access to this API for GET operations only. Also see keylessQps and keylessQpd."
       keylessQps:
         type: "integer"
         optional: false
